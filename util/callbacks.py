@@ -13,7 +13,7 @@ class EarlyStop():
         self.max_delta = max_delta
         self.counter = 0
         self.min_val_metric = np.inf
-        self.max_val_metric = 0
+        self.max_val_metric = -10
 
     def evaluate_decreasing_metric(self, val_metric):
         """
