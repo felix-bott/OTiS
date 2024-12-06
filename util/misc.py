@@ -326,7 +326,7 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
 
 
 def save_best_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler, test_stats, evaluation_criterion, 
-                    mode="increasing", domains:Dict=None, domain_offsets:Dict=None):
+                    mode="increasing", domains:Dict=None, domain_offsets:Dict=None, nb_ckpts_max=2):
     output_dir = Path(args.output_dir)
     epoch_name = str(epoch)
 
@@ -337,13 +337,17 @@ def save_best_model(args, epoch, model, model_without_ddp, optimizer, loss_scale
     exceptions = ["log.txt"]
     file_names = [file for file in file_names if file not in exceptions and evaluation_criterion in file]
 
-    # save the 5 best performing models
-    if len(file_names) >= 1 and is_main_process():
+    # save the nb_ckpts_max best performing models
+    # Felix: with the old implementation, if there was only one saved checkpoint, it will always be deleted before saving the next one.
+    # Thus, there will always be only one saved checkpoint and it is not necessarily the best one.
+    if len(file_names) >= nb_ckpts_max and is_main_process():
         # file_names = sorted(file_names, key=lambda str: int(re.search(r'\d+', str).group()))
         if mode == "increasing":
-            file_names = sorted(file_names, key=lambda x: float(x.split(".pth")[0].split("-")[-1]), reverse=True)
+            #file_names = sorted(file_names, key=lambda x: float(x.split(".pth")[0].split("-")[-1]), reverse=True)
+            file_names = sorted(file_names, key=lambda x: float(re.search(r'avg-(-?\d+\.\d+)', x).group(1)), reverse=True)
         else: # decreasing
-            file_names = sorted(file_names, key=lambda x: float(x.split(".pth")[0].split("-")[-1]))
+            #file_names = sorted(file_names, key=lambda x: float(x.split(".pth")[0].split("-")[-1]))
+            file_names = sorted(file_names, key=lambda x: float(re.search(r'avg-(-?\d+\.\d+)', x).group(1)))           
         os.remove(os.path.join(output_dir, file_names[-1]))
 
     if loss_scaler is not None:
@@ -390,7 +394,7 @@ def get_best_ckpt(data_path, eval_criterion):
     print(f"Searching for the checkpoint file with the best evaluation score in: {data_path}")
 
     # Regex pattern to match the filenames and extract the scores
-    pattern = re.compile(r'checkpoint-\d+'+f'-{eval_criterion}-'+r'(\d+\.\d+)\.pth')
+    pattern = re.compile(r'checkpoint-\d+'+f'-{eval_criterion}-'+r'(-?\d+\.\d+)\.pth')
 
     # Variables to keep track of the best score and corresponding filename
 
@@ -456,3 +460,83 @@ def add_weight_decay_unfrozen_modules(model, weight_decay=1e-5, lr_scale=1.0, sk
 
     return [{'params': no_decay, 'weight_decay': 0., "lr_scale": lr_scale},
             {'params': decay, 'weight_decay': weight_decay, "lr_scale": lr_scale}], skip_list_new
+
+
+from torch.utils.data.sampler import Sampler
+import random
+
+# class StratifiedBatchSampler(Sampler):
+#     def __init__(self, MILgroup, batch_size, num_groups_in_batch=3):
+#         self.MILgroup = MILgroup
+#         self.batch_size = batch_size
+#         self.num_groups_in_batch = num_groups_in_batch
+#         self.group_to_indices = defaultdict(list)
+#         for idx, group in enumerate(MILgroup):
+#             self.group_to_indices[group].append(idx)
+#         if len(self.group_to_indices) < num_groups_in_batch:
+#             raise ValueError("The dataset has fewer groups than the required number of groups per batch.")
+#         self.epoch = 0
+
+#     def set_epoch(self, epoch):
+#         self.epoch = epoch
+
+#     def __iter__(self):
+#         groups = list(self.group_to_indices.keys())
+#         random.shuffle(groups)
+#         batches = []
+        
+#         while len(groups) >= self.num_groups_in_batch:
+#             selected_groups = random.sample(groups, self.num_groups_in_batch)
+#             batch = []
+#             for group in selected_groups:
+#                 indices = self.group_to_indices[group]
+#                 random.shuffle(indices)
+#                 group_samples = min(len(indices), self.batch_size // self.num_groups_in_batch)
+#                 batch.extend(indices[:group_samples])
+#                 self.group_to_indices[group] = indices[group_samples:]
+#             groups = [group for group in groups if self.group_to_indices[group]]
+#             batches.extend(batch[:self.batch_size])
+#         for idx in batches:
+#             yield idx
+
+#     def __len__(self):
+#         total_samples = sum(len(indices) for indices in self.group_to_indices.values())
+#         return total_samples // self.batch_size
+    
+from torch.utils.data import DistributedSampler
+class StratifiedBatchSampler(DistributedSampler):
+    def __init__(self, dataset, num_replicas=None, rank=None, bag_size=4):
+        super().__init__(dataset, num_replicas=num_replicas, rank=rank, shuffle=False)
+        self.bag_size = bag_size
+        #self.num_dat = len(dataset)
+        self.group_to_indices = defaultdict(list)
+        for idx, group in enumerate(dataset.MILgroup):
+            self.group_to_indices[group].append(idx)
+
+    def __iter__(self):
+        groups = list(self.group_to_indices.keys())
+        bag_list = []
+
+        for currGroup in groups:
+            inds_group = self.group_to_indices[currGroup]
+            random.shuffle(inds_group)
+
+            while(len(inds_group) > 0):
+                bag_size_effective = min(len(inds_group), self.bag_size)
+                bag_list.append(inds_group[:bag_size_effective])
+                inds_group = inds_group[bag_size_effective:]
+
+        random.shuffle(bag_list)
+        ind_list = [item for bag in bag_list for item in bag]
+        return(iter(ind_list))
+    
+        # # Split indices for the current process (rank)
+        # total_samples = len(ind_list)
+        # samples_per_replica = total_samples // self.num_replicas
+        # remainder = total_samples % self.num_replicas
+
+        # start = self.rank * samples_per_replica + min(self.rank, remainder)
+        # end = start + samples_per_replica + (1 if self.rank < remainder else 0)
+
+        # return iter(ind_list[start:end])
+    
