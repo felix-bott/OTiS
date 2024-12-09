@@ -60,7 +60,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     # required for metrics calculation
     logits, labels = [], []
 
-    for data_iter_step, (samples, targets, targets_mask, pos_embed_y) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, (samples, targets, targets_mask, pos_embed_y, MILgroup) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         # we use a per iteration (instead of per epoch) lr scheduler
         if data_iter_step % accum_iter == 0:
             lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
@@ -77,9 +77,62 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
 
+        # with torch.cuda.amp.autocast():
+        #     outputs = model(samples, pos_embed_y) * targets_mask
+        #     loss = criterion(outputs, targets)
+        
         with torch.cuda.amp.autocast():
             outputs = model(samples, pos_embed_y) * targets_mask
-            loss = criterion(outputs, targets)
+            
+            # If MIL is enabled
+            if args.enable_MIL:
+                # Map MILgroup strings to unique indices using a Python dictionary
+                group_to_index = {group: idx for idx, group in enumerate(set(MILgroup))}
+                inverse_indices = [group_to_index[group] for group in MILgroup]
+
+                # Convert to a tensor only when needed
+                inverse_indices = torch.tensor(inverse_indices, device=outputs.device)
+
+                unique_groups = len(group_to_index)  # Number of unique groups
+
+                if args.MIL_agg_method == "mean":    
+                    # Compute group-wise sums and counts
+                    group_sums = torch.zeros(unique_groups, outputs.size(1), device=outputs.device).index_add_(
+                        0, inverse_indices, outputs
+                    )
+                    group_counts = torch.zeros(unique_groups, device=outputs.device).index_add_(
+                        0, inverse_indices, torch.ones_like(inverse_indices, dtype=torch.float32, device=outputs.device)
+                    )
+
+                    # Compute mean outputs for each group
+                    outputs = group_sums / group_counts.unsqueeze(1)
+                
+                    # Similarly, compute mean targets for each group
+                    targets = torch.zeros_like(group_sums).index_add_(
+                        0, inverse_indices, targets
+                    ) / group_counts.unsqueeze(1)
+
+                elif args.MIL_agg_method == "max":
+                    # Compute max outputs for each group
+                    outputs = torch.zeros(unique_groups, outputs.size(1), device=outputs.device).scatter_reduce_(
+                        0, inverse_indices.unsqueeze(-1).expand_as(outputs), outputs, reduce="amax"
+                    )
+
+                    # Compute max targets for each group
+                    targets = torch.zeros(unique_groups, targets.size(1), device=targets.device).scatter_reduce_(
+                        0, inverse_indices.unsqueeze(-1).expand_as(targets), targets, reduce="amax"
+                    )
+                else:
+                    raise Exception("unknown MIL aggregation method")
+
+
+            if args.label_smoothing:
+                targets_smoothed = targets + torch.normal(mean=0, std=args.label_smoothing, size=targets.shape, device=targets.device)
+            else:
+                targets_smoothed = targets
+                
+            # Compute the loss
+            loss = criterion(outputs, targets_smoothed)
 
         loss_value = loss.item()
 
@@ -234,6 +287,8 @@ def evaluate(data_loader, model, device, epoch, log_writer=None, args=None):
         pos_embed_y = batch[3]
         pos_embed_y = pos_embed_y.to(device, non_blocking=True)
 
+        MILgroup  = batch[4]
+
         if args.downstream_task == 'classification':
             target_mask = target_mask.unsqueeze(dim=-1).repeat(1, args.nb_classes)
 
@@ -242,6 +297,33 @@ def evaluate(data_loader, model, device, epoch, log_writer=None, args=None):
             embedding = model.forward_features(images, pos_embed_y)
             output = model.forward_head(embedding)
             output = output * target_mask
+
+            # If MIL is enabled
+            if True: #args.enable_MIL:
+                # Map MILgroup strings to unique indices using a Python dictionary
+                group_to_index = {group: idx for idx, group in enumerate(set(MILgroup))}
+                inverse_indices = [group_to_index[group] for group in MILgroup]
+
+                # Convert to a tensor only when needed
+                inverse_indices = torch.tensor(inverse_indices, device=output.device)
+
+                # Compute group-wise sums and counts
+                unique_groups = len(group_to_index)  # Number of unique groups
+                group_sums = torch.zeros(unique_groups, output.size(1), device=output.device).index_add_(
+                    0, inverse_indices, output
+                )
+                group_counts = torch.zeros(unique_groups, device=output.device).index_add_(
+                    0, inverse_indices, torch.ones_like(inverse_indices, dtype=torch.float32, device=output.device)
+                )
+
+                # Compute mean outputs for each group
+                output = group_sums / group_counts.unsqueeze(1)
+
+                # Similarly, compute mean targets for each group
+                target = torch.zeros_like(group_sums).index_add_(
+                    0, inverse_indices, target
+                ) / group_counts.unsqueeze(1)
+
             loss = criterion(output, target)
 
         if args.save_embeddings:
@@ -278,7 +360,15 @@ def evaluate(data_loader, model, device, epoch, log_writer=None, args=None):
         if not os.path.exists(logits_path):
             os.makedirs(logits_path)
         
-        file_name = f"logits_test.pt" if args.eval else f"logits_{epoch}.pt"
+        if args.eval and args.eval_train:
+            file_name = f"logits_train.pt"
+        elif args.eval and args.eval_replication:
+            raise Exception("not fully implemented yet. Need to adapt dataset_fb.py.")
+            #file_name = f"logits_replication.pt" if args.eval else f"logits_replication{epoch}.pt"
+        elif args.test_only:
+            file_name = f"logits_test.pt"
+        else:
+            file_name = f"logits_test.pt" if args.eval else f"logits_test{epoch}.pt"
         torch.save(logits, os.path.join(logits_path, file_name))
 
     test_stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
@@ -301,16 +391,16 @@ def evaluate(data_loader, model, device, epoch, log_writer=None, args=None):
         test_stats["auprc"] = auprc
     elif args.downstream_task == 'regression':
         rmse = np.float64(root_mean_squared_error(logits, labels, multioutput="raw_values"))
-        test_stats["rmse"] = rmse if isinstance(rmse, float) else rmse.mean(axis=-1)
+        test_stats["rmse"] = rmse if isinstance(rmse, float) else rmse[0] #.mean(axis=-1)
 
         mae = np.float64(mean_absolute_error(logits, labels, multioutput="raw_values"))
-        test_stats["mae"] = mae if isinstance(mae, float) else mae.mean(axis=-1)
+        test_stats["mae"] = mae if isinstance(mae, float) else mae[0] #.mean(axis=-1)
 
         pcc = np.concatenate([r_regression(logits[:, i].view(-1, 1), labels[:, i]) for i in range(labels.shape[-1])], axis=0)
-        test_stats["pcc"] = pcc if isinstance(pcc, float) else pcc.mean(axis=-1)
+        test_stats["pcc"] = pcc if isinstance(pcc, float) else pcc[0] #.mean(axis=-1)
 
         r2 = np.stack([r2_score(labels[:, i], logits[:, i]) for i in range(labels.shape[-1])], axis=0)
-        test_stats["r2"] = r2 if isinstance(r2, float) else r2.mean(axis=-1)
+        test_stats["r2"] = r2 if isinstance(r2, float) else r2[0] #.mean(axis=-1)
 
     if args.downstream_task == 'classification':
         print('* Acc@1 {top1_acc:.2f} Acc@1 (balanced) {acc_balanced:.2f} Precision {precision:.2f} Recall {recall:.2f} F1 {f1:.2f} AUROC {auroc:.2f} AUPRC {auprc:.2f} loss {losses:.3f}'
