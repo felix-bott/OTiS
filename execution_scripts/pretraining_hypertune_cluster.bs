@@ -1,0 +1,61 @@
+#!/bin/bash
+
+# To execute this script in the terminal and then exit ssh use
+# conda activate otis
+# nohup ./pretraining_hypertune_cluster.bs &> /vol/aimspace/users/bofe/TurBo/logs/output_pretraining_hypertune.log &
+
+RUN_MODE="local"
+project_name="pretrain"
+run_name="OrthoAggSchaefer100_freq-all_epochLength-10_overlap-0" # run
+continue_from_ckpnt="n"
+hyperparams=(
+    "3e-4:16:1" #learning_rate:batch_size:accum_iter
+    #"1e-4:16:1"
+    #"3e-4:16:1"
+    #"1e-3:16:1"
+    #"1e-4:16:4" 
+    #"3e-4:16:4"
+    #"1e-3:16:4"
+)
+# note: the setting 1e-4:16:4 worked before ...at least with 400 epochs and 40 warmup_epochs
+
+# Function to check the number of active jobs
+check_active_jobs() {
+    local max_jobs=2 # set maximum number of jobs to submit to cluster
+    local active_jobs=$(squeue -u $USER --noheader | wc -l)
+
+    # Wait until the number of active jobs is less than max_jobs
+    while [ "$active_jobs" -ge "$max_jobs" ]; do
+        echo "Waiting for jobs to finish... Currently $active_jobs active jobs."
+        sleep 600
+        active_jobs=$(squeue -u $USER --noheader | wc -l)
+    done
+}
+
+# Iterate over each learning rate
+for param in "${hyperparams[@]}"; do
+    IFS=":" read -r blr batch_size accum_iter <<< "$param"
+
+    logdir=/vol/aimspace/users/bofe/TurBo/slurmOutputs/pretrainedModels/${run_name}/setting_${blr}_${batch_size}_${accum_iter}
+    mkdir -p $logdir
+
+    if [ "$RUN_MODE" = "cluster" ]; then
+        # Check and wait for fewer than a certain number of active jobs before submitting a new one
+        check_active_jobs
+
+        # Run on the cluster using sbatch
+        echo "Running experiment with blr=$blr, batch_size=$batch_size, accum_iter=$accum_iter"
+        sbatch --output="${logdir}/%A.out" --error="${logdir}/%A.err" ./pretraining_cluster.bs $blr $batch_size $accum_iter $run_name $RUN_MODE $continue_from_ckpnt
+
+    elif [ "$RUN_MODE" = "local" ]; then
+        
+        
+        # Run locally (call the script directly)
+        echo "Running experiment with blr=$blr, batch_size=$batch_size, accum_iter=$accum_iter"
+        ./pretraining_cluster.bs $blr $batch_size $accum_iter $run_name $RUN_MODE $continue_from_ckpnt &> "${logdir}/local_run.log" &
+        wait # Wait for the previous command to complete before starting the next one
+    else
+        echo "Error: Invalid RUN_MODE specified. Use 'local' or 'cluster'."
+        exit 1
+    fi
+done

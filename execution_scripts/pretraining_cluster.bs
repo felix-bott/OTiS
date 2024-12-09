@@ -1,0 +1,128 @@
+#!/bin/bash
+
+current_learning_rate=$1
+current_batch_size=$2
+current_accum_iter=$3
+run_name=$4
+RUN_MODE=$5
+continue_from_ckpnt=$6
+
+# Check if the script is running as an sbatch job
+if [ "$RUN_MODE" = "cluster" ]; then
+    echo "Running as an sbatch job (Job ID: $SLURM_JOB_ID)"
+    device_arg=""
+else
+    echo "Running locally or outside sbatch."
+    device_arg="--device cuda:1"
+fi
+
+
+outputdir=/vol/aimspace/users/bofe/TurBo/trainedModels/pretrainedModels/${run_name}/setting_${current_learning_rate}_${current_batch_size}_${current_accum_iter}
+echo $outputdir
+mkdir -p $outputdir
+
+
+#SBATCH --job-name=pretraining_hypertune
+##SBATCH --output=/vol/aimspace/users/bofe/TurBo/slurmOutputs/pretrainedModels/blub%A.out
+##SBATCH --error=/vol/aimspace/users/bofe/TurBo/slurmOutputs/pretrainedModels/blub%A.err
+#SBATCH --mail-user=felix.bott@tum.de
+#SBATCH --mail-type=ALL
+##SBATCH --partition=universe,asteroids
+##SBATCH --qos=master-queuesave
+#SBATCH --time=0-00:10:00
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+
+# Load python module
+ml python/anaconda3
+source $(conda info --base)/etc/profile.d/conda.sh
+
+# Activate corresponding environment
+# If you launch your script from a terminal where your environment is already loaded, conda won't activate the environment. The following guards against that. Not necessary if you always run this script from a clean terminal
+conda deactivate
+conda deactivate # sometimes there seems to be a "nested" python environment, e.g., (base) on top of (otis). To ensure a clean slate, I use conda deactivate twice.
+
+# If the following does not work, try 'source activate <env-name>'
+conda activate otis
+conda env list
+
+
+# Look for a checkpoint file in the output directory
+if [[ $continue_from_ckpnt == "y" ]]; then
+    checkpoint_files=$(ls "$outputdir" | grep -E 'checkpoint-[0-9]+-ncc-[0-9]+\.[0-9]+\.pth')
+else
+    checkpoint_files=""
+fi
+
+# Initialize variables to store the file with the maximum checkpoint_iter
+max_checkpoint_file=""
+max_checkpoint_iter=-1
+
+# Loop through each checkpoint file to find the one with the largest checkpoint_iter
+for checkpoint_file in $checkpoint_files; do
+    # Extract the integer after "checkpoint-"
+    checkpoint_iter=$(echo "$checkpoint_file" | grep -oP '(?<=checkpoint-)\d+')
+    
+    # Check if this checkpoint_iter is the largest found so far
+    if (( checkpoint_iter > max_checkpoint_iter )); then
+        max_checkpoint_iter=$checkpoint_iter
+        max_checkpoint_file=$checkpoint_file
+    fi
+done
+
+# Check if we found any checkpoint files
+if [[ -n "$max_checkpoint_file" ]]; then
+    checkpoint_path="$outputdir/$max_checkpoint_file"
+    echo "Checkpoint file found: $checkpoint_path with highest iteration: $max_checkpoint_iter"
+    
+    # Increment max_checkpoint_iter by 1 to set the start_epoch
+    start_epoch=$((max_checkpoint_iter + 1))
+
+    # Set the resume argument to use this checkpoint file
+    resume_arg="--resume $checkpoint_path"
+    start_epoch_arg="--start_epoch $start_epoch"
+else
+    echo "Starting training from scratch."
+    resume_arg=""
+    start_epoch_arg=""
+fi
+
+
+# Set the base command based on RUN_MODE
+if [ "$RUN_MODE" = "cluster" ]; then
+    # Find a port within a specific range (49152-65535)
+    DYNAMIC_PORT=$(python -c "import socket; import random; s = socket.socket(); s.bind(('', random.randint(49152, 65535))); print(s.getsockname()[1])")
+    base_cmd=("torchrun" "--rdzv-endpoint=localhost:$DYNAMIC_PORT" "--nproc_per_node" "1" "--nnodes" "1" "--node_rank" "0")
+else
+    base_cmd=("python" "-u")
+fi
+
+# Common arguments
+cmd=(
+    "${base_cmd[@]}"
+    /vol/aimspace/users/bofe/TurBo/OTiS/main_pretrain.py
+    --data_path /vol/aimspace/users/bofe/TurBo/data/preTraining/sourceSignalsNormalized/"$run_name"/
+    --CVtable_path /vol/aimspace/users/bofe/TurBo/data/preTraining/resTables/CV5Table_manualEdit.csv
+    --batch_size "$current_batch_size"
+    --wandb
+    --wandb_entity felix_lightweightandreasonablebias
+    --wandb_project pretraining_"$run_name"
+    --accum_iter "$current_accum_iter"
+    --blr "$current_learning_rate"
+    --epochs 800
+    --warmup_epochs 40
+    --output_dir "$outputdir"
+    --mask_ratio 0.50
+    --ncc_weight 10
+    --patch_width 25
+    #--masked_patch_loss
+    #--pretrained_encoder /vol/aimspace/users/bofe/TurBo/OTiS_weights/otis_base.pth
+    #--ignore_pos_embed_y
+    $resume_arg
+    $start_epoch_arg
+    $device_arg
+)
+
+# Run the command
+"${cmd[@]}"

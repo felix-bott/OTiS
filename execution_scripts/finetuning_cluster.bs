@@ -1,0 +1,204 @@
+#!/bin/bash
+
+current_learning_rate=$1
+current_batch_size=$2
+current_weight_decay=$3
+current_drop_path=$4
+current_layer_decay=$5
+fold=$6
+run_name=$7
+RUN_MODE=$8
+outputdir=$9
+modelGroup=${10}
+
+# Check if the script is running as an sbatch job
+if [ "$RUN_MODE" = "cluster" ]; then
+    echo "Running as an sbatch job (Job ID: $SLURM_JOB_ID)"
+    device_arg=""
+else
+    echo "Running locally or outside sbatch."
+    device_arg="--device cuda:1"
+fi
+echo $outputdir
+
+
+#SBATCH --job-name=finetuning_hypertune_testcluster
+##SBATCH --output=/vol/aimspace/users/bofe/TurBo/slurmOutputs/job%A.out
+##SBATCH --error=/vol/aimspace/users/bofe/TurBo/slurmOutputs/job%A.err
+#SBATCH --mail-user=felix.bott@tum.de
+#SBATCH --mail-type=ALL
+##SBATCH --partition=universe,asteroids
+##SBATCH --qos=master-queuesave
+#SBATCH --time=0-06:00:00
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=128G
+
+
+# Load python module
+ml python/anaconda3
+source $(conda info --base)/etc/profile.d/conda.sh
+
+# Activate corresponding environment
+# If you launch your script from a terminal where your environment is already loaded, conda won't activate the environment. The following guards against that. Not necessary if you always run this script from a clean terminal
+conda deactivate
+conda deactivate # sometimes there seems to be a "nested" python environment, e.g., (base) on top of (otis). To ensure a clean slate, I use conda deactivate twice.
+
+# If the following does not work, try 'source activate <env-name>'
+conda activate otis
+conda env list
+
+
+# Look for a checkpoint file in the output directory
+continue_from_ckpnt="n"
+if [[ $continue_from_ckpnt == "y" ]]; then
+    checkpoint_files=$(ls "$outputdir" | grep -E 'checkpoint-[0-9]+-avg-[0-9]+\.[0-9]+\.pth')
+else
+    checkpoint_files=""
+fi
+echo $checkpoint_files
+
+
+# Initialize variables to store the file with the maximum checkpoint_iter
+max_checkpoint_file=""
+max_checkpoint_iter=-1
+
+# Loop through each checkpoint file to find the one with the largest checkpoint_iter
+for checkpoint_file in $checkpoint_files; do
+    # Extract the integer after "checkpoint-"
+    checkpoint_iter=$(echo "$checkpoint_file" | grep -oP '(?<=checkpoint-)\d+')
+    
+    # Check if this checkpoint_iter is the largest found so far
+    if (( checkpoint_iter > max_checkpoint_iter )); then
+        max_checkpoint_iter=$checkpoint_iter
+        max_checkpoint_file=$checkpoint_file
+    fi
+done
+
+# Check if we found any checkpoint files
+if [[ -n "$max_checkpoint_file" ]]; then
+    checkpoint_path="$outputdir/$max_checkpoint_file"
+    echo "Checkpoint file found: $checkpoint_path with highest iteration: $max_checkpoint_iter"
+    
+    # Increment max_checkpoint_iter by 1 to set the start_epoch
+    start_epoch=$((max_checkpoint_iter + 1))
+
+    # Set the resume argument to use this checkpoint file
+    resume_arg="--resume $checkpoint_path"
+    start_epoch_arg="--start_epoch $start_epoch"
+else
+    echo "No checkpoint file found. Starting training from scratch."
+    resume_arg=""
+    start_epoch_arg=""
+fi
+
+
+# Set norm_tab_name and pretrained_model_path based on run_name
+case "$run_name" in
+    "OrthoAggSchaefer100_freq-all_epochLength-20_overlap-0.5" | \
+    "OrthoAggSchaefer100_freq-all_epochLengthCUT-2_overlapCUT-0.5")
+        norm_tab_name="CV70-20-10Table_OrthoAggSchaefer100_all_MegaStrat_normFactorsNew.csv"
+        pretrained_model_path="/vol/aimspace/users/bofe/TurBo/trainedModels/pretrainedModels/OrthoAggSchaefer100_freq-all_epochLength-10_overlap-0"
+        ;;
+    "Schaefer100_freq-all_epochLength-20_overlap-0.5" | \
+    "Schaefer100_freq-all_epochLengthCUT-2_overlapCUT-0.5")
+        norm_tab_name="CV70-20-10Table_Schaefer100_all_MegaStrat_normFactorsNew.csv"
+        pretrained_model_path="/vol/aimspace/users/bofe/TurBo/trainedModels/pretrainedModels/Schaefer100_freq-all_epochLength-10_overlap-0"
+        ;;
+    *)
+        echo "Cannot find matching normalization factor table"
+        exit 1
+        ;;
+esac
+
+
+hardCodedPretrainedModel="" #"/vol/aimspace/users/bofe/TurBo/trainedModels/pretrainedModels/OrthoAggSchaefer100_freq-all_epochLength-10_overlap-0/setting_1.01e-3_16_1/checkpoint-1516-ncc-0.6863.pth"
+if [[ "$hardCodedPretrainedModel" == "" ]]; then
+    # Identify pre-trained model with the highest ncc-score
+    max_ncc=-1
+    max_ncc_file=""
+
+    # Loop over all subfolders and search for files matching the pattern
+    for file in $(find "$pretrained_model_path" -type f -name "checkpoint-*-ncc-*.pth"); do
+        # Extract the float value after "ncc-"
+        ncc_value=$(echo "$file" | grep -oP '(?<=ncc-)[0-9]+\.[0-9]+')
+        
+        # Check if this ncc_value is the highest found so far
+        if (( $(echo "$ncc_value > $max_ncc" | bc -l) )); then
+            max_ncc=$ncc_value
+            max_ncc_file=$file
+        fi
+    done
+
+    # Output the result
+    if [[ -n "$max_ncc_file" ]]; then
+        echo "File with the highest NCC score: $max_ncc_file"
+        echo "Highest NCC score: $max_ncc"
+    else
+        echo "No matching files found."
+    fi
+else
+    echo "Using hard-coded pretrained model: $hardCodedPretrainedModel"
+    max_ncc_file=$hardCodedPretrainedModel
+fi
+
+# Set the base command based on RUN_MODE
+if [ "$RUN_MODE" = "cluster" ]; then
+    # Find a port within a specific range (49152-65535)
+    DYNAMIC_PORT=$(python -c "import socket; import random; s = socket.socket(); s.bind(('', random.randint(49152, 65535))); print(s.getsockname()[1])")
+    base_cmd=("torchrun" "--rdzv-endpoint=localhost:$DYNAMIC_PORT" "--nproc_per_node" "1" "--nnodes" "1" "--node_rank" "0")
+else
+    base_cmd=("python" "-u")
+fi
+
+echo finetuning_"$modelGroup"_"$run_name"
+
+# Common arguments
+cmd=(
+    "${base_cmd[@]}"
+    /vol/aimspace/users/bofe/TurBo/OTiS/main_finetune.py
+    --data_path /vol/aimspace/users/bofe/TurBo/data/fineTuning/sourceSignals/"$run_name"/
+    --labels_path /vol/aimspace/users/bofe/TurBo/data/fineTuning/resTables/CV70-20-10Table_MegaStrat.csv
+    --CVtable_path /vol/aimspace/users/bofe/TurBo/data/fineTuning/resTables/CV70-20-10Table_MegaStrat.csv
+    --NCtable_path /vol/aimspace/users/bofe/TurBo/data/fineTuning/resTables/normFactors/"$norm_tab_name"
+    --fold "$fold"
+    --finetune "$max_ncc_file"
+    --output_dir "$outputdir"
+    --log_dir "$outputdir"/logs
+    --downstream_task regression
+    --upper_bnd 1
+    --nb_classes 1
+    --target_weights 1
+    --eval_criterion avg
+    --wandb
+    --wandb_entity felix_lightweightandreasonablebias
+    --wandb_project finetuning_"$modelGroup"_"$run_name"
+    --blr "$current_learning_rate"
+    --batch_size "$current_batch_size"
+    --epochs 50
+    --warmup_epochs 5
+    --weight_decay "$current_weight_decay"
+    --accum_iter 1
+    --drop_path "$current_drop_path"
+    --layer_decay "$current_layer_decay"
+    --crop_lower_bnd 1
+    --crop_upper_bnd 1
+    --ft_surr_phase_noise 0
+    --rescaling_sigma 0
+    --jitter_sigma 0
+    --max_delta 0.00
+    --patience 25
+    --patch_width 100
+    --test
+    --enable_MIL
+    --bag_size 6
+    #--normalize_segments
+    --label_smoothing 0.1
+    --MIL_agg_method "max"
+    $resume_arg
+    $start_epoch_arg
+)
+
+# Run the command
+"${cmd[@]}"
+

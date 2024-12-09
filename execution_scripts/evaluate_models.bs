@@ -1,0 +1,73 @@
+#!/bin/bash
+
+# Load python module
+ml python/anaconda3
+source $(conda info --base)/etc/profile.d/conda.sh
+
+# Activate corresponding environment
+# If you launch your script from a terminal where your environment is already loaded, conda won't activate the environment. The following guards against that. Not necessary if you always run this script from a clean terminal
+conda deactivate
+conda deactivate # sometimes there seems to be a "nested" python environment, e.g., (base) on top of (otis). To ensure a clean slate, I use conda deactivate twice.
+
+# If the following does not work, try 'source activate <env-name>'
+conda activate otis
+conda env list
+
+
+project_name="pretrain"
+norm_tab_name="CV70-10-20Table_Schaefer100_all_MegaStrat_normFactors.csv"
+run_name="OrthoAggSchaefer100_freq-all_epochLength-20_overlap-0.5" # run
+modelGroup="noPretrainingCVjointTune2" #finetunedModels
+
+folderdir=/vol/aimspace/users/bofe/TurBo/trainedModels/${modelGroup}/${run_name}
+echo $folderdir
+
+outputdir=${folderdir}
+mkdir -p $outputdir/evalResults
+
+
+# Iterate over CV-folds
+for fold in Fold1 Fold2 Fold3 Fold4 Fold5 
+do
+
+    # Identify fine-tuned model with the highest avg-score
+    max_avg=-1
+    max_avg_file=""
+
+    # Loop over all subfolders and search for files matching the pattern
+    for file in $(find "$folderdir/$fold" -type f -name "checkpoint-*-avg-*.pth"); do
+        # Extract the float value after "avg-"
+        avg_value=$(echo "$file" | grep -oP '(?<=avg-)-?[0-9]+\.[0-9]+')
+
+        # Check if this avg_value is the highest found so far
+        if (( $(echo "$avg_value > $max_avg" | bc -l) )); then
+            max_avg=$avg_value
+            max_avg_file=$file
+        fi
+    done
+
+    # Output the result
+    if [[ -n "$max_avg_file" ]]; then
+        echo "File with the highest avg score: $max_avg_file in $fold"
+        echo "Highest avg score: $max_avg in $fold"
+    else
+        echo "No matching files found."
+    fi
+
+
+
+    python -u /vol/aimspace/users/bofe/TurBo/OTiS/main_finetune_fb.py \
+    --fold $fold\
+    --data_path /vol/aimspace/users/bofe/TurBo/data/fineTuning/sourceSignals/"$run_name"/\
+    --labels_path /vol/aimspace/users/bofe/TurBo/data/fineTuning/resTables/CV70-10-20Table_MegaStrat.csv\
+    --CVtable_path /vol/aimspace/users/bofe/TurBo/data/fineTuning/resTables/CV70-10-20Table_MegaStrat.csv\
+    --NCtable_path /vol/aimspace/users/bofe/TurBo/data/fineTuning/resTables/normFactors/"$norm_tab_name"\
+    --test_only\
+    --device cuda:0\
+    --output_dir $folderdir/evalResults/$fold/\
+    --downstream_task regression\
+    --upper_bnd 1\
+    --nb_classes 1\
+    --resume $max_avg_file\
+    --save_logits
+done

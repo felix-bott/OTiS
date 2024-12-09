@@ -1,0 +1,89 @@
+#!/bin/bash
+
+# To execute this script in the terminal and then exit ssh use
+# conda activate otis
+# nohup ./finetuning_hypertune_CV_cluster.bs &> /vol/aimspace/users/bofe/TurBo/logs/output_finetuning_CV_hypertune.log &
+
+
+RUN_MODE="local"
+project_name="pretrain"
+run_name="OrthoAggSchaefer100_freq-all_epochLength-20_overlap-0.5" # run
+
+# Function to check the number of active jobs
+check_active_jobs() {
+    local max_jobs=2 # set maximum number of jobs to submit to cluster
+    local active_jobs=$(squeue -u $USER --noheader | wc -l)
+
+    # Wait until the number of active jobs is less than max_jobs
+    while [ "$active_jobs" -ge "$max_jobs" ]; do
+        echo "Waiting for jobs to finish... Currently $active_jobs active jobs."
+        sleep 600
+        active_jobs=$(squeue -u $USER --noheader | wc -l)
+    done
+}
+
+
+# echo "There is still a problem: As of the sequential optimization, trainig with certain
+# parameter settings can only happen once training with other paramter settings is complete. 
+# However, in the current implementation, the training script for a certain parameter setting 
+# is executed (i.e., the job is sent) even though training with the other parameter settings 
+# that must have completed before is not yet completed."
+# exit 1
+
+modelGroup="pretraining50CV10MIL_maxAggMILSmooth" #finetunedModels
+
+# Iterate over CV-folds
+max_iterations=128
+counter=0
+# Iterate over hyper parameter settings
+while [ $counter -lt $max_iterations ]; do
+    # Increment the counter
+    ((counter++))
+
+    # Iterate over CV-folds
+    for fold in Fold1 Fold2 Fold3 #Fold4 Fold5 Fold6 Fold7 Fold8 Fold9 Fold10 
+    do  
+        folddir=/vol/aimspace/users/bofe/TurBo/trainedModels/${modelGroup}/${run_name}/${fold}
+        echo $folddir
+
+        # Get hyperparameters from external script
+        param=$(python ./sequential_hyper_tune.py $folddir)
+        if [ "$param" == "done" ]; then
+            echo "Finalized sequential optimization of hyper parameters."
+            break
+        fi
+
+        # Parse parameters
+        IFS=":" read -r blr batch_size weight_decay drop_path layer_decay<<< "$param" 
+        echo "Running experiment with blr=$blr, batch_size=$batch_size, weight_decay=$weight_decay, drop_path=$drop_path, layer_decay=$layer_decay"
+
+        logdir=/vol/aimspace/users/bofe/TurBo/slurmOutputs/${modelGroup}/${run_name}/${fold}/setting_${blr}_${batch_size}_${weight_decay}_${drop_path}_${layer_decay} 
+        outputdir=${folddir}/setting_${blr}_${batch_size}_${weight_decay}_${drop_path}_${layer_decay}
+        mkdir -p $logdir
+        mkdir -p $outputdir
+
+        # Run based on the selected mode
+        if [ "$RUN_MODE" = "cluster" ]; then
+            # Check and wait for fewer than a certain number of active jobs before submitting a new one
+            check_active_jobs
+
+            # Submit job to cluster using sbatch
+            sbatch --output="${logdir}/%A.out" --error="${logdir}/%A.err" ./finetuning_cluster.bs $blr $batch_size $weight_decay $drop_path $layer_decay $fold $run_name $RUN_MODE $outputdir $modelGroup
+
+        elif [ "$RUN_MODE" = "local" ]; then
+            # Run locally (call the script directly)
+            ./finetuning_cluster.bs $blr $batch_size $weight_decay $drop_path $layer_decay $fold $run_name $RUN_MODE $outputdir $modelGroup &> "${logdir}/local_run.log" &
+            wait # Wait for the previous command to complete before starting the next one
+        else
+            echo "Error: Invalid RUN_MODE specified. Use 'local' or 'cluster'."
+            exit 1
+        fi
+
+        echo "Finished experiment"
+    done
+    
+    # Wait for all background processes (folds) to finish before moving to the next parameter setting
+    echo "Waiting for all folds to complete for parameter setting $counter..."
+    wait
+    echo "All folds completed for parameter setting $counter."
+done
