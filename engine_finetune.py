@@ -309,20 +309,40 @@ def evaluate(data_loader, model, device, epoch, log_writer=None, args=None):
 
                 # Compute group-wise sums and counts
                 unique_groups = len(group_to_index)  # Number of unique groups
-                group_sums = torch.zeros(unique_groups, output.size(1), device=output.device).index_add_(
-                    0, inverse_indices, output
-                )
-                group_counts = torch.zeros(unique_groups, device=output.device).index_add_(
-                    0, inverse_indices, torch.ones_like(inverse_indices, dtype=torch.float32, device=output.device)
-                )
 
-                # Compute mean outputs for each group
-                output = group_sums / group_counts.unsqueeze(1)
+                if args.MIL_agg_method == "mean":    
+                    # Compute group-wise sums and counts
+                    group_sums = torch.zeros(unique_groups, output.size(1), device=output.device).index_add_(
+                        0, inverse_indices, output
+                    )
+                    group_counts = torch.zeros(unique_groups, device=output.device).index_add_(
+                        0, inverse_indices, torch.ones_like(inverse_indices, dtype=torch.float32, device=output.device)
+                    )
 
-                # Similarly, compute mean targets for each group
-                target = torch.zeros_like(group_sums).index_add_(
-                    0, inverse_indices, target
-                ) / group_counts.unsqueeze(1)
+                    # Compute mean outputs for each group
+                    output = group_sums / group_counts.unsqueeze(1)
+                
+                    # Similarly, compute mean targets for each group
+                    target = torch.zeros_like(group_sums).index_add_(
+                        0, inverse_indices, target
+                    ) / group_counts.unsqueeze(1)
+
+                elif args.MIL_agg_method == "max":
+                    # Compute max outputs for each group
+                    output = torch.zeros(unique_groups, output.size(1), device=output.device).scatter_reduce_(
+                        0, inverse_indices.unsqueeze(-1).expand_as(output), output, reduce="amax"
+                    )
+
+                    # Compute max targets for each group
+                    target = torch.zeros(unique_groups, target.size(1), device=target.device).scatter_reduce_(
+                        0, inverse_indices.unsqueeze(-1).expand_as(target), target, reduce="amax"
+                    )
+                else:
+                    raise Exception("unknown MIL aggregation method")
+
+
+
+
 
             loss = criterion(output, target)
 
