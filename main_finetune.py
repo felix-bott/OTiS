@@ -9,6 +9,7 @@
 # DeiT: https://github.com/facebookresearch/deit
 # BEiT: https://github.com/microsoft/unilm/tree/master/beit
 # --------------------------------------------------------
+print("hello 0")
 import os
 import argparse
 
@@ -34,7 +35,7 @@ from timm.models.layers import trunc_normal_
 from timm.data.mixup import Mixup
 from timm.loss import SoftTargetCrossEntropy #, LabelSmoothingCrossEntropy
 
-from util.dataset import TimeSeriesDataset
+from util.dataset_fb import TimeSeriesDataset_fb
 import util.lr_decay as lrd
 import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
@@ -45,6 +46,9 @@ import models_vit
 
 from engine_finetune import train_one_epoch, evaluate
 
+from util.misc import StratifiedBatchSampler
+
+print("hello 1")
 
 def get_args_parser():
     parser = argparse.ArgumentParser('OTiS fine-tuning', add_help=False)
@@ -62,6 +66,16 @@ def get_args_parser():
     parser.add_argument('--univariate', action='store_true', default=False,
                         help='Univariate time series analysis (i.e. treat each variate independently)')
     
+    parser.add_argument('--enable_MIL', action='store_true', default=False,
+                        help='enable multi instance learning')
+    parser.add_argument('--MIL_agg_method', type=str, default='mean',
+                        help='MIL aggregation method')
+    parser.add_argument('--bag_size', type=int, default=6, metavar='N',
+                        help='number of instances per bag (approximate)')
+
+    parser.add_argument('--normalize_segments', action='store_true', default=False,
+                        help='normalize signals within individual segments, with separate constants across segments, individuals, and studies.')
+
     parser.add_argument('--input_channels', type=int, default=1, metavar='N',
                         help='input channels')
     parser.add_argument('--input_electrodes', type=int, default=12, metavar='N',
@@ -110,6 +124,9 @@ def get_args_parser():
     parser.add_argument('--aa', type=str, default='rand-m9-mstd0.5-inc1', metavar='NAME',
                         help='Use AutoAugment policy. "v0" or "original". " + "(default: rand-m9-mstd0.5-inc1)')
 
+    parser.add_argument('--label_smoothing', default=None, type=float,
+                        help='std of gaussian noise added to targets')
+
     # Optimizer parameters
     parser.add_argument('--clip_grad', type=float, default=None, metavar='NORM',
                         help='Clip gradient norm (default: None, no clipping)')
@@ -131,9 +148,9 @@ def get_args_parser():
 
     # Callback parameters
     parser.add_argument('--patience', default=-1, type=float,
-                        help='Early stopping whether val is worse than train for specified nb of epochs (default: -1, i.e. no early stopping)')
+                        help='OUTDATED: Early stopping whether val is worse than train for specified nb of epochs (default: -1, i.e. no early stopping)')
     parser.add_argument('--max_delta', default=0, type=float,
-                        help='Early stopping threshold (val has to be worse than (train+delta)) (default: 0)')
+                        help='OUTDATED: Early stopping threshold (val has to be worse than (train+delta)) (default: 0)')
 
     # Criterion parameters
     parser.add_argument('--smoothing', type=float, default=0.1,
@@ -185,6 +202,12 @@ def get_args_parser():
     
     parser.add_argument('--data_path', default='', type=str,
                         help='dataset path (default: None)')
+    parser.add_argument('--CVtable_path', default='_.csv', type=str,
+                        help='(cross) validation table path')
+    parser.add_argument('--fold', default='Fold1', type=str,
+                        help='Identifier of current fold (default: Fold1)')
+    parser.add_argument('--NCtable_path', default='_.csv', type=str,
+                        help='Norm constant table path')
     parser.add_argument('--labels_path', default='', type=str,
                         help='labels path (default: None)')
     parser.add_argument('--labels_mask_path', default='', type=str,
@@ -196,6 +219,9 @@ def get_args_parser():
                         help='validation labels path (default: None)')
     parser.add_argument('--val_labels_mask_path', default='', type=str,
                         help='validation labels path (default: None)')
+
+    parser.add_argument('--test_only', action='store_true', default=False,
+                        help='evaluate model on test data')
 
     parser.add_argument('--test', action='store_true', default=False)
     parser.add_argument('--test_data_path', default='', type=str,
@@ -209,6 +235,8 @@ def get_args_parser():
                         help='lower_bnd')
     parser.add_argument('--upper_bnd', type=int, default=0, metavar='N',
                         help='upper_bnd')
+    parser.add_argument('--target_weights', nargs='+', type=float, default=[1.0], metavar='N',
+                        help='target_weights')
 
     parser.add_argument('--nb_classes', default=2, type=int,
                         help='number of the classification types')
@@ -242,7 +270,11 @@ def get_args_parser():
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true',
-                        help='Perform evaluation only')
+                        help='Perform evaluation only (in validation set)')
+    parser.add_argument('--eval_train', action='store_true', default=False,
+                        help='Perform evaluation only (in training sets). Only in combination with --eval.')
+    parser.add_argument('--eval_replication', action='store_true', default=False,
+                        help='NOT FULLY IMPLEMENTED YET: Perform evaluation only (in replication sets). Only in combination with --eval.')
     parser.add_argument('--num_workers', default=24, type=int)
     parser.add_argument('--pin_mem', action='store_true', default=True,
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
@@ -261,12 +293,15 @@ def get_args_parser():
     return parser
 
 def main(args):
+    print("hello 2")
     args.input_size = (args.input_channels, args.input_electrodes, args.time_steps)
     args.patch_size = (args.patch_height, args.patch_width)
 
     print(f"cuda devices: {torch.cuda.device_count()}")
     misc.init_distributed_mode(args)
     # args.distributed = False
+
+    print("hello 3")
 
     # wandb logging
     if args.wandb == True and misc.is_main_process():
@@ -291,25 +326,33 @@ def main(args):
 
     cudnn.benchmark = True
     
-    dataset_train = TimeSeriesDataset(data_path=args.data_path, 
+    dataset_train = TimeSeriesDataset_fb(data_path=args.data_path,
+                                      CVtable_path=args.CVtable_path, 
+                                      NCtable_path=args.NCtable_path, 
                                       labels_path=args.labels_path, 
                                       labels_mask_path=args.labels_mask_path, 
                                       downstream_task=args.downstream_task, 
                                       univariate=args.univariate,
                                       train=True, 
+                                      test=False,
                                       N_val=1,
                                       args=args)
-    dataset_val = TimeSeriesDataset(data_path=args.val_data_path, 
-                                    labels_path=args.val_labels_path, 
+    dataset_val = TimeSeriesDataset_fb(data_path=args.data_path, 
+                                    CVtable_path=args.CVtable_path,
+                                    NCtable_path=args.NCtable_path, 
+                                    labels_path=args.labels_path, 
                                     labels_mask_path=args.val_labels_mask_path, 
                                     downstream_task=args.downstream_task, 
                                     domain_offsets=dataset_train.offsets, 
                                     univariate=args.univariate,
                                     train=False, 
+                                    test=False,
                                     N_val=1,
                                     args=args)
-    dataset_test = TimeSeriesDataset(data_path=args.test_data_path, 
-                                    labels_path=args.test_labels_path, 
+    dataset_test = TimeSeriesDataset_fb(data_path=args.data_path, 
+                                    CVtable_path=args.CVtable_path,
+                                    NCtable_path=args.NCtable_path, 
+                                    labels_path=args.labels_path, 
                                     labels_mask_path=args.test_labels_mask_path, 
                                     downstream_task=args.downstream_task, 
                                     domain_offsets=dataset_train.offsets, 
@@ -333,10 +376,25 @@ def main(args):
         print(f"num_tasks: {num_tasks}")
         global_rank = misc.get_rank()
         print(f"global_rank: {global_rank}")
-        sampler_train = torch.utils.data.DistributedSampler(
-            dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-        )
-        # print("Sampler_train = %s" % str(sampler_train))
+
+        shuffle_train = not args.eval_train
+
+        # Stratified sampling for training set
+        if args.enable_MIL: 
+            print("Using stratified sampling for training...")
+            sampler_train = StratifiedBatchSampler(
+                dataset_train, num_replicas=num_tasks, rank=global_rank, bag_size=args.bag_size
+            )
+        else:
+            sampler_train = torch.utils.data.DistributedSampler(
+                dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=shuffle_train
+            )
+
+
+        # sampler_train = torch.utils.data.DistributedSampler(
+        #     dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=shuffle_train
+        # )
+        # # print("Sampler_train = %s" % str(sampler_train))
 
         if args.dist_eval:
             if len(dataset_val) % num_tasks != 0:
@@ -609,13 +667,18 @@ def main(args):
         else:
             nb_ckpts = int(sub_strings[-1])+1
 
+        if args.eval_train:
+            data_loader_eval = data_loader_train
+        else:
+            data_loader_eval = data_loader_val
+
         for epoch in range(0, nb_ckpts):
             if "checkpoint" not in sub_strings[-1]:
                 args.resume = "/".join(sub_strings[:-1]) + "/checkpoint-" + str(epoch) + ".pth"
 
             misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
-            test_stats, test_history = evaluate(data_loader_val, model_without_ddp, device, epoch, log_writer=log_writer, args=args)
+            test_stats, test_history = evaluate(data_loader_eval, model_without_ddp, device, epoch, log_writer=log_writer, args=args)
             if args.downstream_task == 'classification':
                 print(f"Accuracy / Accuracy (balanced) / Precision / Recall / F1 / AUROC / AUPRC of the network on {len(dataset_val)} test images: ",
                       f"{test_stats['acc']:.2f}% / {test_stats['acc_balanced']:.2f}% / {test_stats['precision']:.2f}% / {test_stats['recall']:.2f}% / ",
@@ -630,15 +693,24 @@ def main(args):
 
         exit(0)
 
+    if args.test_only and misc.is_main_process():
+        checkpoint = torch.load(args.resume)
+        model_without_ddp.load_state_dict(checkpoint['model'])
+        print("Run test data on checkpoint model %s" % args.resume)
+        
+        test_stats, test_history = evaluate(data_loader_test, model_without_ddp, device, epoch=-1, log_writer=log_writer, args=args)
+
+        exit(0)
+
     # Define callbacks
     early_stop = EarlyStop(patience=args.patience, max_delta=args.max_delta)
     
     print(f"Start training for {args.epochs} epochs")
     
     best_stats = {'loss':np.inf, 'acc':0.0, 'acc_balanced':0.0, 'precision':0.0, 'recall':0.0, 'f1':0.0, 'auroc':0.0, 'auprc':0.0, 
-                  'avg':0.0, 'epoch':0, 'rmse':np.inf, 'mae':np.inf, 'pcc':0.0, 'r2':-1.0}
-    best_eval_scores = {'count':0, 'nb_ckpts_max':5, 'eval_criterion':[best_stats[args.eval_criterion]]}
-    for epoch in range(args.start_epoch, args.epochs):
+                  'avg':-10.0, 'epoch':0, 'rmse':np.inf, 'mae':np.inf, 'pcc':-1.0, 'r2':-1.0}
+    nb_ckpts_max = 2
+    for epoch in range(args.start_epoch, 32):#args.epochs):
         start_time = time.time()
 
         if True: #args.distributed:
@@ -646,28 +718,43 @@ def main(args):
         
         train_stats, train_history = train_one_epoch(model, criterion, data_loader_train, optimizer, device, epoch, 
                                                      loss_scaler, args.clip_grad, mixup_fn, log_writer=log_writer, args=args)
+        train_history = {
+            'epoch': train_history['epoch'],
+            'lr': train_history['lr'],
+            'pcc': train_history['pcc'],
+            'r2': train_history['r2']
+        }
 
         test_stats, test_history = evaluate(data_loader_val, model_without_ddp, device, epoch, log_writer=log_writer, args=args)
+        test_history = {
+            'epoch': test_history['epoch'],
+            'test_pcc': test_history['test_pcc'],
+            'test_r2': test_history['test_r2']
+        }
+
+        actual_test_stats, actual_test_history = evaluate(data_loader_test, model_without_ddp, device, epoch, log_writer=log_writer, args=args)
+        actual_test_history = {
+            'epoch': actual_test_history['epoch'],
+            'actual_pcc': actual_test_history['test_pcc'],
+            'actual_r2': actual_test_history['test_r2']
+        }
 
         if args.eval_criterion in ["loss", "rmse", "mae"]:
             test_stats['avg'] = (test_stats['rmse'] + test_stats['mae']) / 2
 
             if early_stop.evaluate_decreasing_metric(val_metric=test_stats[args.eval_criterion]) and misc.is_main_process():
                 print("Early stopping the training")
+                if args.output_dir and misc.is_main_process():
+                    with open(f"{args.output_dir}/COMPLETIONCERTIFICATE.txt", "w") as file:
+                        file.write("training completed, early stopping")
                 break
-            if args.output_dir and test_stats[args.eval_criterion] <= max(best_eval_scores['eval_criterion']):
-                # save the best 5 (nb_ckpts_max) checkpoints, even if they appear after the best checkpoint wrt time
-                if best_eval_scores['count'] < best_eval_scores['nb_ckpts_max']:
-                    best_eval_scores['count'] += 1
-                else:
-                    best_eval_scores['eval_criterion'] = sorted(best_eval_scores['eval_criterion'])
-                    best_eval_scores['eval_criterion'].pop()
-                best_eval_scores['eval_criterion'].append(test_stats[args.eval_criterion])
+            
+            # Felix deleted code here. Now, always saving latest checkpoint in addition to best.
 
-                misc.save_best_model(
-                    args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                    loss_scaler=loss_scaler, epoch=epoch, test_stats=test_stats, evaluation_criterion=args.eval_criterion, 
-                    mode="decreasing", domains=dataset_train.domains, domain_offsets=dataset_train.offsets)
+            misc.save_best_model(
+                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+                loss_scaler=loss_scaler, epoch=epoch, test_stats=test_stats, evaluation_criterion=args.eval_criterion, 
+                mode="decreasing", domains=dataset_train.domains, domain_offsets=dataset_train.offsets, nb_ckpts_max=nb_ckpts_max)
         else:
             if args.downstream_task == 'classification':
                 test_stats['avg'] = (test_stats['acc_balanced'] + test_stats['precision'] + test_stats['recall'] + test_stats['f1']) / 4
@@ -676,21 +763,18 @@ def main(args):
             
             if early_stop.evaluate_increasing_metric(val_metric=test_stats[args.eval_criterion]) and misc.is_main_process():
                 print("Early stopping the training")
+                if args.output_dir and misc.is_main_process():
+                    with open(f"{args.output_dir}/COMPLETIONCERTIFICATE.txt", "w") as file:
+                        file.write("training completed, early stopping")
                 break
-            if args.output_dir and test_stats[args.eval_criterion] >= min(best_eval_scores['eval_criterion']):
-                # save the best 5 (nb_ckpts_max) checkpoints, even if they appear after the best checkpoint wrt time
-                if best_eval_scores['count'] < best_eval_scores['nb_ckpts_max']:
-                    best_eval_scores['count'] += 1
-                else:
-                    best_eval_scores['eval_criterion'] = sorted(best_eval_scores['eval_criterion'], reverse=True)
-                    best_eval_scores['eval_criterion'].pop()
-                best_eval_scores['eval_criterion'].append(test_stats[args.eval_criterion])
-
-                misc.save_best_model(
-                    args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                    loss_scaler=loss_scaler, epoch=epoch, test_stats=test_stats, evaluation_criterion=args.eval_criterion, 
-                    mode="increasing", domains=dataset_train.domains, domain_offsets=dataset_train.offsets)
-
+             
+            # Felix deleted code here. Now, always saving latest checkpoint in addition to best.
+            print(model.pos_embed_x.shape)
+            misc.save_best_model(
+                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+                loss_scaler=loss_scaler, epoch=epoch, test_stats=test_stats, evaluation_criterion=args.eval_criterion, 
+                mode="increasing", domains=dataset_train.domains, domain_offsets=dataset_train.offsets, nb_ckpts_max=nb_ckpts_max)
+            
         test_history['test_avg'] = test_stats['avg']
 
         best_stats['loss'] = min(best_stats['loss'], test_stats['loss'])
@@ -736,8 +820,11 @@ def main(args):
                   f"of the network on {len(dataset_val)} test images: {test_stats['rmse']:.4f} / {test_stats['mae']:.4f} / ",
                   f"{test_stats['pcc']:.4f} / {test_stats['r2']:.4f}")
             print(f'Min Root Mean Squared Error (RMSE) / Min Mean Absolute Error (MAE) / Max Pearson Correlation Coefficient (PCC) / ',
-                  f'Max R Squared (R2): {best_stats["rmse"]:.4f} / {best_stats["mae"]:.4f} / {best_stats["pcc"]:.4f} / {best_stats["r2"]:.4f}\n')
-        
+                  f'Max R Squared (R2): {best_stats["rmse"]:.4f} / {best_stats["mae"]:.4f} / {best_stats["pcc"]:.4f} / {best_stats["r2"]:.4f}')
+            print(f"TEST: Root Mean Squared Error (RMSE) / Mean Absolute Error (MAE) / Pearson Correlation Coefficient (PCC) / R Squared (R2) ",
+                  f"of the network on {len(dataset_test)} test images: {actual_test_stats['rmse']:.4f} / {actual_test_stats['mae']:.4f} / ",
+                  f"{actual_test_stats['pcc']:.4f} / {actual_test_stats['r2']:.4f}\n")
+
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()}, 
                      **{f'test_{k}': v for k, v in test_stats.items()}, 
                      'epoch': epoch, 
@@ -751,8 +838,15 @@ def main(args):
 
         total_time = time.time() - start_time
         if args.wandb and misc.is_main_process():
-            wandb.log(train_history | test_history | {"Time per epoch [sec]": total_time})
+            wandb.log(train_history | test_history | actual_test_history | {"Time per epoch [sec]": total_time}, step = epoch)
 
+        if epoch == args.epochs-1 and args.output_dir and misc.is_main_process():
+            with open(f"{args.output_dir}/COMPLETIONCERTIFICATE.txt", "w") as file:
+                file.write("training completed, max epoch reached")
+
+
+    with open(f"{args.output_dir}/COMPLETIONCERTIFICATE.txt", "w") as file:
+        file.write("training completed, end of loop reached")
 
     if args.test and misc.is_main_process():
         args.resume = misc.get_best_ckpt(args.output_dir, eval_criterion=args.eval_criterion)
@@ -763,17 +857,20 @@ def main(args):
         
         test_stats, test_history = evaluate(data_loader_test, model_without_ddp, device, epoch=-1, log_writer=log_writer, args=args)
         
-        actual_test_history = {}
+        actual_test_history2 = {}
         for k,v in test_history.items():
             key = k
             if 'est' in k:
                 key = 'actual_' + key
-                actual_test_history[key] = v 
-
-        print(actual_test_history)
+                actual_test_history2[key] = v 
+        actual_test_history2 = {
+            'actual_test_pcc': actual_test_history2['actual_test_pcc'],
+            'actual_test_r2': actual_test_history2['actual_test_r2']
+        }
+        print(actual_test_history2)
 
         if args.wandb and misc.is_main_process():
-            wandb.log(actual_test_history)
+            wandb.log(actual_test_history2)
 
 
     if args.wandb and misc.is_main_process():
