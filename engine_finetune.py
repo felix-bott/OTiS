@@ -127,6 +127,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
             if args.label_smoothing:
+                epoch_specific_seed = epoch * 1000 + data_iter_step  # Ensure unique seeds
+                torch.manual_seed(epoch_specific_seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed(epoch_specific_seed)
+
                 targets_smoothed = targets + torch.normal(mean=0, std=args.label_smoothing, size=targets.shape, device=targets.device)
             else:
                 targets_smoothed = targets
@@ -339,10 +344,6 @@ def evaluate(data_loader, model, device, epoch, log_writer=None, args=None):
                     )
                 else:
                     raise Exception("unknown MIL aggregation method")
-
-
-
-
 
             loss = criterion(output, target)
 

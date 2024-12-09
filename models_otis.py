@@ -773,8 +773,15 @@ class OTiS(nn.Module):
             var = target.var(dim=-1, keepdim=True)
             target = (target - mean) / (var + 1.e-6)**.5
 
+        # # FELIX suggested edit to normalize the squared error term to make loss invariant w.r.t. scale of signal???
+        # target_avgstd = torch.mean(torch.std(imgs, dim=3), dim=2)
+        # target_avgstd = target_avgstd.unsqueeze(2).repeat(1, target.shape[1], target.shape[2])
+        # # [N, L, p*q*C]
+        # loss = ((pred - target) / target_avgstd) ** 2
+
         # [N, L, p*q*C]
         loss = (pred - target) ** 2
+
         # [N, L, 1]
         attn_mask_loss = attn_mask.flatten(1).unsqueeze(-1)
         # [N, L, p*q*C]

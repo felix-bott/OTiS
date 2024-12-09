@@ -68,7 +68,9 @@ def get_args_parser():
     
     parser.add_argument('--enable_MIL', action='store_true', default=False,
                         help='enable multi instance learning')
-    parser.add_argument('--bag_size', type=int, default=4, metavar='N',
+    parser.add_argument('--MIL_agg_method', type=str, default='mean',
+                        help='MIL aggregation method')
+    parser.add_argument('--bag_size', type=int, default=6, metavar='N',
                         help='number of instances per bag (approximate)')
 
     parser.add_argument('--normalize_segments', action='store_true', default=False,
@@ -121,6 +123,9 @@ def get_args_parser():
                         help='Color jitter factor (enabled only when not using Auto/RandAug)')
     parser.add_argument('--aa', type=str, default='rand-m9-mstd0.5-inc1', metavar='NAME',
                         help='Use AutoAugment policy. "v0" or "original". " + "(default: rand-m9-mstd0.5-inc1)')
+
+    parser.add_argument('--label_smoothing', default=None, type=float,
+                        help='std of gaussian noise added to targets')
 
     # Optimizer parameters
     parser.add_argument('--clip_grad', type=float, default=None, metavar='NORM',
@@ -705,7 +710,7 @@ def main(args):
     best_stats = {'loss':np.inf, 'acc':0.0, 'acc_balanced':0.0, 'precision':0.0, 'recall':0.0, 'f1':0.0, 'auroc':0.0, 'auprc':0.0, 
                   'avg':-10.0, 'epoch':0, 'rmse':np.inf, 'mae':np.inf, 'pcc':-1.0, 'r2':-1.0}
     nb_ckpts_max = 2
-    for epoch in range(args.start_epoch, args.epochs):
+    for epoch in range(args.start_epoch, 32):#args.epochs):
         start_time = time.time()
 
         if True: #args.distributed:
@@ -713,8 +718,26 @@ def main(args):
         
         train_stats, train_history = train_one_epoch(model, criterion, data_loader_train, optimizer, device, epoch, 
                                                      loss_scaler, args.clip_grad, mixup_fn, log_writer=log_writer, args=args)
+        train_history = {
+            'epoch': train_history['epoch'],
+            'lr': train_history['lr'],
+            'pcc': train_history['pcc'],
+            'r2': train_history['r2']
+        }
 
         test_stats, test_history = evaluate(data_loader_val, model_without_ddp, device, epoch, log_writer=log_writer, args=args)
+        test_history = {
+            'epoch': test_history['epoch'],
+            'test_pcc': test_history['test_pcc'],
+            'test_r2': test_history['test_r2']
+        }
+
+        actual_test_stats, actual_test_history = evaluate(data_loader_test, model_without_ddp, device, epoch, log_writer=log_writer, args=args)
+        actual_test_history = {
+            'epoch': actual_test_history['epoch'],
+            'actual_pcc': actual_test_history['test_pcc'],
+            'actual_r2': actual_test_history['test_r2']
+        }
 
         if args.eval_criterion in ["loss", "rmse", "mae"]:
             test_stats['avg'] = (test_stats['rmse'] + test_stats['mae']) / 2
@@ -797,8 +820,11 @@ def main(args):
                   f"of the network on {len(dataset_val)} test images: {test_stats['rmse']:.4f} / {test_stats['mae']:.4f} / ",
                   f"{test_stats['pcc']:.4f} / {test_stats['r2']:.4f}")
             print(f'Min Root Mean Squared Error (RMSE) / Min Mean Absolute Error (MAE) / Max Pearson Correlation Coefficient (PCC) / ',
-                  f'Max R Squared (R2): {best_stats["rmse"]:.4f} / {best_stats["mae"]:.4f} / {best_stats["pcc"]:.4f} / {best_stats["r2"]:.4f}\n')
-        
+                  f'Max R Squared (R2): {best_stats["rmse"]:.4f} / {best_stats["mae"]:.4f} / {best_stats["pcc"]:.4f} / {best_stats["r2"]:.4f}')
+            print(f"TEST: Root Mean Squared Error (RMSE) / Mean Absolute Error (MAE) / Pearson Correlation Coefficient (PCC) / R Squared (R2) ",
+                  f"of the network on {len(dataset_test)} test images: {actual_test_stats['rmse']:.4f} / {actual_test_stats['mae']:.4f} / ",
+                  f"{actual_test_stats['pcc']:.4f} / {actual_test_stats['r2']:.4f}\n")
+
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()}, 
                      **{f'test_{k}': v for k, v in test_stats.items()}, 
                      'epoch': epoch, 
@@ -812,11 +838,15 @@ def main(args):
 
         total_time = time.time() - start_time
         if args.wandb and misc.is_main_process():
-            wandb.log(train_history | test_history | {"Time per epoch [sec]": total_time}, step = epoch)
+            wandb.log(train_history | test_history | actual_test_history | {"Time per epoch [sec]": total_time}, step = epoch)
 
         if epoch == args.epochs-1 and args.output_dir and misc.is_main_process():
             with open(f"{args.output_dir}/COMPLETIONCERTIFICATE.txt", "w") as file:
                 file.write("training completed, max epoch reached")
+
+
+    with open(f"{args.output_dir}/COMPLETIONCERTIFICATE.txt", "w") as file:
+        file.write("training completed, end of loop reached")
 
     if args.test and misc.is_main_process():
         args.resume = misc.get_best_ckpt(args.output_dir, eval_criterion=args.eval_criterion)
@@ -827,17 +857,20 @@ def main(args):
         
         test_stats, test_history = evaluate(data_loader_test, model_without_ddp, device, epoch=-1, log_writer=log_writer, args=args)
         
-        actual_test_history = {}
+        actual_test_history2 = {}
         for k,v in test_history.items():
             key = k
             if 'est' in k:
                 key = 'actual_' + key
-                actual_test_history[key] = v 
-
-        print(actual_test_history)
+                actual_test_history2[key] = v 
+        actual_test_history2 = {
+            'actual_test_pcc': actual_test_history2['actual_test_pcc'],
+            'actual_test_r2': actual_test_history2['actual_test_r2']
+        }
+        print(actual_test_history2)
 
         if args.wandb and misc.is_main_process():
-            wandb.log(actual_test_history)
+            wandb.log(actual_test_history2)
 
 
     if args.wandb and misc.is_main_process():
