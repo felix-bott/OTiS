@@ -1,3 +1,8 @@
+# Felix
+execution_scripts/wandb/
+execution_scripts/python/
+execution_scripts/outputdir/
+
 # custom
 .vscode/
 logs/
