@@ -14,12 +14,24 @@ from torchvision import transforms
 import util.augmentations as augmentations
 import util.transformations as transformations
 
+#import mne
+import matplotlib.pyplot as plt
+import numpy as np
+import warnings
+import scipy
+import os
+import re
+import pandas as pd
 
-class TimeSeriesDataset(Dataset):
+import csv
+
+class TimeSeriesDataset_fb(Dataset):
     """
     Dataset for multi-domain time series analysis.
     """
     def __init__(self, data_path:str, labels_path:str=None, labels_mask_path:str=None, 
+                 CVtable_path:str=None,
+                 NCtable_path:str=None,
                  downstream_task:str=None, 
                  domain_offsets:Dict=None, domain_agnostic:str=False, 
                  univariate:bool=False, 
@@ -41,7 +53,106 @@ class TimeSeriesDataset(Dataset):
             train: training or validation / test
             N_val: nb of chunks to validate / test
         """
-        data = torch.load(data_path, map_location=torch.device('cpu')) # load to ram
+        print("hello 4")
+        # # Özgüns original data load function #################################################################
+        # data = torch.load(data_path, map_location=torch.device('cpu')) # load to ram
+
+        # # Load data with function from mne package. This only works if the sample times are identical for all epochs. #################################################################
+        # data = mne.read_epochs_fieldtrip('/Users/felixbott/Desktop/CPNFU/testData/sub-010002__set-LEMON__task-_ses-_AnalysisID_preTraining.mat', 
+        #                                     info = None,
+        #                                     data_name = 'brainSignals')
+
+        # Load data with function from scipy package #################################################################
+        # List all files in the specified directory (data_path)
+        allFiles = os.listdir(data_path)
+        if train:
+            sampleTypeSelect = 'train' # training
+        elif test:
+            sampleTypeSelect = 'test' # testing in indepedent data
+        else:
+            sampleTypeSelect = 'val' # validating
+
+        # load cross validation table
+        if CVtable_path:
+            CVtable = pd.read_csv(CVtable_path)
+        else:
+            CVtable = None
+
+        if NCtable_path:
+            NCtable = pd.read_csv(NCtable_path)
+        else:
+            NCtable = None
+
+        # Initialize empty lists to store combined data, subject IDs, and set IDs
+        dataList = []
+        subjectList = []
+        setList = []
+
+        # Check if 'eval' is a key in args, if not, set it to False
+        if not hasattr(args, 'eval'):
+            args.eval = False
+
+        # To speed up data loading when evaluating the model on the validation set...
+        if not args.eval or (args.eval and not test and not train) or (args.eval and args.eval_train and train) or (args.test_only and test):
+
+            # Iterate over all files in the directory
+            for currFile in allFiles:
+
+                # Extract the subject ID from the current file name using a regular expression
+                patternSubject = r"(sub-[^_]+)"
+                matchSubject = re.search(patternSubject, currFile)
+                currSubject = matchSubject.group(1)
+                
+                # Extract the set ID from the current file name using a regular expression
+                patternSet = r"(set-[^_]+)"
+                matchSet = re.search(patternSet, currFile)
+                currSet = matchSet.group(1)
+
+                if CVtable is not None:
+                    if sum((CVtable['participant_id'] == currSubject) & (CVtable['set'] == currSet[4:])) == 1:
+                        sampleType = CVtable[args.fold][(CVtable['participant_id'] == currSubject) & (CVtable['set'] == currSet[4:])].values[0]
+                    else:
+                        continue
+
+                    if sampleType != sampleTypeSelect:
+                        continue
+
+                # Load the MATLAB structure (.mat)
+                dataSubject = scipy.io.loadmat(data_path + currFile)
+
+                # Iterate over all epochs (signal segments) in the current file
+                for iSegment in range(0, dataSubject['brainSignals']['trial'][0,0].size):
+                    # Check that signal has been demeaned
+                    if np.max(np.abs(np.mean(dataSubject['brainSignals']['trial'][0,0][0,iSegment], axis=1) \
+                                     / np.std(dataSubject['brainSignals']['trial'][0,0][0,iSegment], axis=1))) > 1e-5:
+                        print(np.max(np.abs(np.mean(dataSubject['brainSignals']['trial'][0,0][0,iSegment], axis=1))))
+                        raise Exception("Singals not properly demeaned")
+
+                    # Rescale signal
+                    dataSubject['brainSignals']['trial'][0,0][0,iSegment] *= np.sqrt(np.exp(-9))
+                    # Normalize signals within study
+                    if NCtable is not None:
+                        dataSubject['brainSignals']['trial'][0,0][0,iSegment] *= NCtable[args.fold][(NCtable['set'] == currSet[4:])].values[0]
+                    # Normalize signals within segments (preserve variability across variates)
+                    if args.normalize_segments:
+                        dataSubject['brainSignals']['trial'][0,0][0,iSegment] /= np.mean(np.std(dataSubject['brainSignals']['trial'][0,0][0,iSegment], axis = 1))
+  
+
+                    # Append the current segment of brain signals to the dataList
+                    dataList.append(dataSubject['brainSignals']['trial'][0,0][0,iSegment])
+
+                    # Append the corresponding subject ID to the subjectList
+                    subjectList.append(matchSubject.group(1))
+
+                    # Append the corresponding set ID to the setList
+                    setList.append(matchSet.group(1))
+                
+        # # Convert the list of data segments (2D NumPy arrays) into a 3D NumPy array
+        # data = np.array(dataList) # array of shape (segments, channels, time points)
+        
+        # Convert the list of 2D NumPy arrays to a list of 2D PyTorch tensors
+        data = [('eeg', torch.tensor(arr, dtype=torch.float32)) for arr in dataList]
+        # End: edit ########
 
         # .unsqueeze(0) to add auxiliary channel (similar to rgb in imgs)
         domain = [(sample[0], sample[1].unsqueeze(0).shape) for sample in data]
@@ -72,10 +183,78 @@ class TimeSeriesDataset(Dataset):
         else:
             self.offsets = domain_offsets
 
+        # # As a sanity check, plot the signals of a few channels
+        # nChanPlot = 6
+        # plt.figure(figsize=(5,10))
+        # for i in range(0,nChanPlot):
+        #     plt.subplot(nChanPlot+1,1, i+1)
+        #     plt.plot(data[0][0,i,0:100])
+        # plt.savefig("/vol/aimspace/users/bofe/TurBo/OTiS/test_plot.png")    
+        
         self.data = data
+        self.MILgroup = subjectList
 
         if labels_path:
-            self.labels = torch.load(labels_path, map_location=torch.device('cpu')) # load to ram
+            # # Özgüns labels data load function ########
+            # self.labels = torch.load(labels_path, map_location=torch.device('cpu')) # load to ram
+
+            # Load the .csv file with labels
+            labels_df = pd.read_csv(labels_path)
+
+            # Initialize a list to store the extracted painVars values
+            painVarsList = []
+
+            # Iterate over all signal segments of all subjects in all sets
+            for i in range(len(subjectList)):
+                # Extract the current subject ID and set ID
+                currSubject = subjectList[i]
+                currSet = setList[i]
+
+                # Extract the corresponding painVars value from the labels DataFrame
+                # painVarValue = labels_df.loc[
+                #     (labels_df['participant_id'] == currSubject) & (labels_df['set'] == currSet[4:]), 
+                #     [args.fold+'_NORMpainVars', args.fold+'_NORMdepressionVars']
+                #     ].values[0]
+                painVarValue = labels_df.loc[
+                    (labels_df['participant_id'] == currSubject) & (labels_df['set'] == currSet[4:]), 
+                    [args.fold+'_NORMpainVars']
+                    ].values[0]
+
+                # Append the painVarValue to the painVarsList
+                painVarsList.append(painVarValue)
+            
+            if not len(args.target_weights) == args.upper_bnd - args.lower_bnd:
+                raise Exception("mismatch between target_weights and number of targets")
+
+            if not args.nb_classes == args.upper_bnd - args.lower_bnd:
+                raise Exception("mismatch between nb_classes and number of targets")
+
+            if len(painVarsList)>0:
+                painVarsList = np.vstack(painVarsList)*np.array(args.target_weights)
+
+
+            # Convert painVarsList to a PyTorch tensor
+            self.labels = torch.tensor(painVarsList, dtype=torch.float32)
+            if(len(self.labels.shape) == 1):
+                self.labels = self.labels.unsqueeze(1)
+            
+            #self.labels = torch.tensor(painVarsList, dtype=torch.float32).unsqueeze(1)
+
+            # Save observations and corresponding subject IDs
+            if (args.eval and not test and not train and args.save_logits) or (args.eval and args.eval_train and train and args.save_logits) or (args.test_only and test):
+                logits_path = os.path.join(args.output_dir, "logits")
+                if not os.path.exists(logits_path):
+                    os.makedirs(logits_path)
+
+                torch.save(self.labels, os.path.join(logits_path, 'labels_'+sampleTypeSelect+'.pt'))
+
+                # Save subjectList to a CSV file
+                with open(os.path.join(logits_path,'subjectList_'+sampleTypeSelect+'.csv'), 'w', newline='') as file:
+                    writer = csv.writer(file)
+                    writer.writerow(subjectList)  # Save as a row
+
+
+            # End: edit ########    
         else:
             self.labels = torch.zeros(size=(len(self.data), ))
 
@@ -86,7 +265,7 @@ class TimeSeriesDataset(Dataset):
 
         self.downstream_task = downstream_task
         self.train = train 
-        self.test = test
+        self.test = test or (not test and not train)
         self.N_val = N_val
         self.args = args
 
@@ -165,7 +344,7 @@ class TimeSeriesDataset(Dataset):
         label_mask = [label_mask for i in range(N)]
         domain = [domain for i in range(N)]
         
-        return data, label, label_mask, self.args.patch_size, domain_offset, domain, self.args.time_steps, self.univariate
+        return data, label, label_mask, self.args.patch_size, domain_offset, domain, self.args.time_steps, self.univariate, self.MILgroup[idx]
 
     @staticmethod
     def collate_fn(batch):
@@ -223,4 +402,5 @@ class TimeSeriesDataset(Dataset):
         pos_embed_y = torch.arange(grid_height).view(-1, 1).repeat(len(batch), 1, grid_width) + 1 + batch[0][4]
         pos_embed_y = torch.stack([pos_embed_y[idx] for idx, sample in enumerate(batch) for data in sample[0]], dim=0)
 
-        return data, label, label_mask, torch.LongTensor(pos_embed_y)
+        MILgroup = [sample[-1] for sample in batch]
+        return data, label, label_mask, torch.LongTensor(pos_embed_y), MILgroup
