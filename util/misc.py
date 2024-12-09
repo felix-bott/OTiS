@@ -505,15 +505,18 @@ import random
     
 from torch.utils.data import DistributedSampler
 class StratifiedBatchSampler(DistributedSampler):
-    def __init__(self, dataset, num_replicas=None, rank=None, bag_size=4):
+    def __init__(self, dataset, num_replicas=None, rank=None, bag_size=4, seed=42):
         super().__init__(dataset, num_replicas=num_replicas, rank=rank, shuffle=False)
         self.bag_size = bag_size
+        self.seed = seed
         #self.num_dat = len(dataset)
         self.group_to_indices = defaultdict(list)
         for idx, group in enumerate(dataset.MILgroup):
             self.group_to_indices[group].append(idx)
 
     def __iter__(self):
+        random.seed(self.seed + self.rank if self.rank is not None else self.seed)
+        
         groups = list(self.group_to_indices.keys())
         bag_list = []
 
@@ -540,3 +543,9 @@ class StratifiedBatchSampler(DistributedSampler):
 
         # return iter(ind_list[start:end])
     
+    def set_epoch(self, epoch):
+        """
+        Optionally update the seed with the epoch number to vary sampling between epochs
+        while maintaining reproducibility.
+        """
+        self.seed += epoch
