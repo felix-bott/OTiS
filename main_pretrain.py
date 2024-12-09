@@ -9,8 +9,11 @@
 # DeiT: https://github.com/facebookresearch/deit
 # BEiT: https://github.com/microsoft/unilm/tree/master/beit
 # --------------------------------------------------------
+
+print("executing main_pretrain_fb...")
 import os
 import argparse
+import warnings
 
 import json
 from typing import Tuple
@@ -27,7 +30,7 @@ import wandb
 # assert timm.__version__ == "0.3.2"  # version check
 import timm.optim.optim_factory as optim_factory
 
-from util.dataset import TimeSeriesDataset
+from util.dataset import TimeSeriesDataset_fb
 import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 from util.pos_embed import interpolate_pos_embed_x
@@ -38,6 +41,7 @@ from sklearn.linear_model import LogisticRegression, LinearRegression
 
 from engine_pretrain import train_one_epoch, evaluate_online, evaluate
 
+#import mne
 
 def get_args_parser():
     parser = argparse.ArgumentParser('OTiS pre-training', add_help=False)
@@ -150,6 +154,10 @@ def get_args_parser():
     
     parser.add_argument('--data_path', default='_.pt', type=str,
                         help='dataset path')
+    parser.add_argument('--CVtable_path', default='_.csv', type=str,
+                        help='(cross) validation table path')
+    parser.add_argument('--fold', default='Fold1', type=str,
+                        help='Identifier of current fold (default: Fold1)')
     parser.add_argument('--val_data_path', default='', type=str,
                         help='validation dataset path')
     
@@ -238,15 +246,18 @@ def main(args):
 
     # load data
     # domain_offsets are initialized in dataset_train
-    dataset_train = TimeSeriesDataset(data_path=args.data_path, 
-                                      domain_agnostic=args.domain_agnostic, 
-                                      univariate=args.univariate,
-                                      train=True, 
-                                      args=args)
-    dataset_val = TimeSeriesDataset(data_path=args.val_data_path, 
+    dataset_train = TimeSeriesDataset_fb(data_path=args.data_path,
+                                        CVtable_path=args.CVtable_path,
+                                        domain_agnostic=args.domain_agnostic, 
+                                        univariate=args.univariate,
+                                        train=True, 
+                                        args=args)
+    dataset_val = TimeSeriesDataset_fb(data_path=args.data_path, 
+                                    CVtable_path=args.CVtable_path,
                                     domain_offsets=dataset_train.offsets, 
                                     univariate=args.univariate,
-                                    train=False, 
+                                    train = False,
+                                    test = True,
                                     N_val=2,
                                     args=args)
 
@@ -316,7 +327,7 @@ def main(args):
 
     # online evaluation
     if args.online_evaluation:
-        dataset_online_train = TimeSeriesDataset(data_path=args.data_path_online, 
+        dataset_online_train = TimeSeriesDataset_fb(data_path=args.data_path_online, 
                                                  labels_path=args.labels_path_online, 
                                                  labels_mask_path=args.labels_mask_path_online, 
                                                  downstream_task=args.online_evaluation_task, 
@@ -324,7 +335,7 @@ def main(args):
                                                  univariate=args.univariate,
                                                  train=True, 
                                                  args=args)
-        dataset_online_val = TimeSeriesDataset(data_path=args.val_data_path_online, 
+        dataset_online_val = TimeSeriesDataset_fb(data_path=args.val_data_path_online, 
                                                labels_path=args.val_labels_path_online, 
                                                labels_mask_path=args.val_labels_mask_path_online, 
                                                downstream_task=args.online_evaluation_task, 
@@ -534,6 +545,9 @@ def main(args):
     
     # following timm: set wd as 0 for bias and norm layers
     param_groups = optim_factory.add_weight_decay(model_without_ddp, args.weight_decay)
+    #param_groups = optim_factory.param_groups_weight_decay(model_without_ddp, weight_decay=args.weight_decay)
+    #warnings.warn('\n\nFelix replaced optim_factory.add_weight_decay with optim_factory.param_groups_weight_decay\n\n')
+
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     print(optimizer)
     loss_scaler = NativeScaler()
@@ -546,7 +560,7 @@ def main(args):
     print(f"Start training for {args.epochs} epochs")
     
     best_stats = {'total_loss':np.inf, 'loss':np.inf, 'ncc':0.0, 'cos_sim':-1.0, 'mse':np.inf, 'mae':np.inf}
-    best_eval_scores = {'count':0, 'nb_ckpts_max':5, 'eval_criterion':[best_stats[args.eval_criterion]]}
+    nb_ckpts_max = 2
     for epoch in range(args.start_epoch, args.epochs):
         start_time = time.time()
 
@@ -575,36 +589,24 @@ def main(args):
             if early_stop.evaluate_decreasing_metric(val_metric=val_stats[args.eval_criterion]) and misc.is_main_process():
                 print("Early stopping the training")
                 break
-            if args.output_dir and val_stats[args.eval_criterion] <= max(best_eval_scores['eval_criterion']):
-                # save the best 5 (nb_ckpts_max) checkpoints, even if they appear after the best checkpoint wrt time
-                if best_eval_scores['count'] < best_eval_scores['nb_ckpts_max']:
-                    best_eval_scores['count'] += 1
-                else:
-                    best_eval_scores['eval_criterion'] = sorted(best_eval_scores['eval_criterion'])
-                    best_eval_scores['eval_criterion'].pop()
-                best_eval_scores['eval_criterion'].append(val_stats[args.eval_criterion])
 
-                misc.save_best_model(
-                    args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                    loss_scaler=loss_scaler, epoch=epoch, test_stats=val_stats, evaluation_criterion=args.eval_criterion, 
-                    mode="decreasing", domains=dataset_train.domains, domain_offsets=dataset_train.offsets)
+            # Felix deleted code here. Now always saving latest checkpoint in addition to best.
+
+            misc.save_best_model(
+                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+                loss_scaler=loss_scaler, epoch=epoch, test_stats=val_stats, evaluation_criterion=args.eval_criterion, 
+                mode="decreasing", domains=dataset_train.domains, domain_offsets=dataset_train.offsets, nb_ckpts_max=nb_ckpts_max)
         else:
             if early_stop.evaluate_increasing_metric(val_metric=val_stats[args.eval_criterion]) and misc.is_main_process():
                 print("Early stopping the training")
                 break
-            if args.output_dir and val_stats[args.eval_criterion] >= min(best_eval_scores['eval_criterion']):
-                # save the best 5 (nb_ckpts_max) checkpoints, even if they appear after the best checkpoint wrt time
-                if best_eval_scores['count'] < best_eval_scores['nb_ckpts_max']:
-                    best_eval_scores['count'] += 1
-                else:
-                    best_eval_scores['eval_criterion'] = sorted(best_eval_scores['eval_criterion'], reverse=True)
-                    best_eval_scores['eval_criterion'].pop()
-                best_eval_scores['eval_criterion'].append(val_stats[args.eval_criterion])
+            
+            # Felix deleted code here. Now always saving latest checkpoint in addition to best.
 
-                misc.save_best_model(
-                    args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                    loss_scaler=loss_scaler, epoch=epoch, test_stats=val_stats, evaluation_criterion=args.eval_criterion, 
-                    mode="increasing", domains=dataset_train.domains, domain_offsets=dataset_train.offsets)
+            misc.save_best_model(
+                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+                loss_scaler=loss_scaler, epoch=epoch, test_stats=val_stats, evaluation_criterion=args.eval_criterion, 
+                mode="increasing", domains=dataset_train.domains, domain_offsets=dataset_train.offsets, nb_ckpts_max=nb_ckpts_max)
         
         best_stats['total_loss'] = min(best_stats['total_loss'], val_stats['total_loss'])
         best_stats['loss'] = min(best_stats['loss'], val_stats['loss'])
@@ -635,7 +637,7 @@ def main(args):
 
         total_time = time.time() - start_time
         if args.wandb and misc.is_main_process():
-            wandb.log(train_history | val_history | online_history | {"Time per epoch [sec]": total_time})
+            wandb.log(train_history | val_history | online_history | {"Time per epoch [sec]": total_time}, step = epoch)
 
     if args.wandb and misc.is_main_process():
         wandb.log({f'Best Statistics/{k}': v for k, v in best_stats.items()})
@@ -649,3 +651,4 @@ if __name__ == '__main__':
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
+    print("finished executing main_pretrain_fb...")
